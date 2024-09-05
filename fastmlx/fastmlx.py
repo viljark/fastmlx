@@ -94,6 +94,14 @@ class ModelProvider:
 
     def load_model(self, model_name: str):
         if model_name not in self.models:
+
+            models = self.get_cached_and_local_models()
+
+            for model in models:
+                if model["id"] == model_name:
+                    model_name = model["local_path"] if model["local_path"].startswith("./models") else model_name
+                    break
+
             config = load_config(model_name)
             model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
             if model_type in MODELS["vlm"]:
@@ -136,7 +144,37 @@ class ModelProvider:
         async with self.lock:
             return list(self.models.keys())
         
-    def get_hf_cache_models(self) -> List[Dict[str, str]]:
+
+    def get_local_models(self, models_dir = './models'):
+        models = []
+
+        # Get a list of all folders (subdirectories) in the models directory
+        model_folders = [f for f in os.listdir(models_dir) if os.path.isdir(os.path.join(models_dir, f))]
+
+        for folder in model_folders:
+            model_path = os.path.join(models_dir, folder)
+            safetensors_files = [f for f in os.listdir(model_path) if f.endswith('.safetensors')]
+            total_size = 0
+            for file in safetensors_files:
+                file_path = os.path.join(model_path, file)
+                file_size = os.path.getsize(file_path)
+                total_size += file_size
+
+            total_size_gb = total_size / (1024 * 1024 * 1024)
+            models.append({
+                "id": folder,
+                "object": "model",
+                "type": "",
+                "size": f"{total_size_gb:.2f}GB",
+                "nb_files": 0,  # Assuming nb_files is not directly available in the folder
+                "last_accessed": "N/A",  # Assuming last_accessed is not directly available in the folder
+                "last_modified": "N/A",  # Assuming last_modified is not directly available in the folder
+                "local_path": model_path,
+            })
+
+        return models
+
+    def get_cached_and_local_models(self) -> List[Dict[str, str]]:
         hf_cache_info = scan_cache_dir()
         models = []
         for repo in sorted(hf_cache_info.repos, key=lambda repo: repo.repo_path):
@@ -151,20 +189,10 @@ class ModelProvider:
                     "last_modified": repo.last_modified_str,
                     "local_path": str(repo.repo_path)
                 })
-        # add custom models which are manually quantizized
-        # TODO: add custom model parsing from ./models folder
-        models.append({
-            "id": "Big-Tiger-Gemma-27B-v1-mlx-4bit",
-            "object": "model",
-            "type": "",
-            "size": "15G",
-            "nb_files": 0,
-            "last_accessed": "N/A",
-            "last_modified": "N/A",
-            "local_path": './models/Big-Tiger-Gemma-27B-v1-mlx-4bit',
-        })
 
-        return models
+        local_models = self.get_local_models()
+
+        return models + local_models
     
     def start_generating(self, model_name: str):
         self.generating_count[model_name] = self.generating_count.get(model_name, 0) + 1
@@ -341,7 +369,6 @@ async def chat_completion(request: ChatCompletionRequest):
             prompt = apply_vlm_chat_template(processor, config, chat_messages)
         else:
             prompt = request.messages[-1].content
-
         if stream:
             generator = vlm_stream_generator(
                     model,
@@ -353,6 +380,7 @@ async def chat_completion(request: ChatCompletionRequest):
                     request.max_tokens,
                     request.temperature,
                     stop_words=stop_words,
+                    stream_options=request.stream_options,
                 )
 
             return StreamingResponse(
@@ -410,13 +438,14 @@ async def chat_completion(request: ChatCompletionRequest):
                     request.max_tokens,
                     request.temperature,
                     stop_words=stop_words,
+                    stream_options=request.stream_options,
                 )
                 return StreamingResponse(
                     model_provider.stream_wrapper(request.model, generator),
                     media_type="text/event-stream",
                 )
         else:
-            output = lm_generate(
+            output, token_length_info  = lm_generate(
                 model,
                 tokenizer,
                 prompt,
@@ -426,7 +455,7 @@ async def chat_completion(request: ChatCompletionRequest):
             )
 
     # Parse the output to check for function calls
-    result = handle_function_calls(output, request)
+    result = handle_function_calls(output, request, token_length_info)
     model_provider.stop_generating(request.model)
 
     return result
@@ -456,10 +485,10 @@ def convert_size_to_bytes(size_string):
 # shoul be ollama compliant, but enchanted is still not picking it up
 @router.get("/api/tags")
 async def get_tags():
-    hf_cache_models = model_provider.get_hf_cache_models()
+    models = model_provider.get_cached_and_local_models()
     
     models = []
-    for model in hf_cache_models:
+    for model in models:
         # Generate a pseudo-digest using the model id
         digest = hashlib.sha256(model['id'].encode()).hexdigest()
         
@@ -507,8 +536,9 @@ async def get_supported_models():
 
 @app.get("/v1/models")
 async def list_models():
-    models = model_provider.get_hf_cache_models()
-    print(models)
+    models = model_provider.get_cached_and_local_models()
+    model_ids = [m['id'] + ' ' + m['size'] for m in models]
+    print('available models\n', json.dumps(model_ids, indent=2))
     return {
         "object": "list",
         "data": models

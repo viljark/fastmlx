@@ -27,6 +27,11 @@ class ChatMessage(BaseModel):
 class ImageURL(BaseModel):
     url: str
 
+class Usage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
@@ -37,13 +42,14 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = Field(default=0.2)
     tools: Optional[List[Function]] = Field(default=None)
     tool_choice: Optional[str] = Field(default=None)
-
+    stream_options: Optional[Dict[str, Any]] = Field(default={ "include_usage": True })
 
 class ChatCompletionResponse(BaseModel):
     id: str
     object: str = "chat.completion"
     created: int
     model: str
+    usage: Usage
     choices: List[dict]
     tool_calls: Optional[List[ToolCall]] = None
 
@@ -54,6 +60,7 @@ class ChatCompletionChunk(BaseModel):
     created: int
     model: str
     choices: List[Dict[str, Any]]
+    usage: Optional[Usage] = None
 
 class CompletionRequest(BaseModel):
     model: str
