@@ -125,6 +125,11 @@ def get_tool_prompt(model_name, tools, prompt):
 
 
 def get_eom_token(model_name):
+    model_name = model_name.lower()
+    if "phi-3.5" in model_name:
+        return ["<|end|>"]    
+    if "gemma-2" in model_name:
+        return ["<end_of_turn>"]
     tool_config = load_tools_config()
     available_models = tool_config["models"].keys()
     model_type = get_model_type(model_name, available_models)
@@ -132,7 +137,10 @@ def get_eom_token(model_name):
         model_type, tool_config["models"]["default"]
     )
     eom_token = model_config.get("eom_token", None)
-    return eom_token
+    if eom_token:
+        return eom_token
+    else:
+        return None
 
 
 def apply_lm_chat_template(
@@ -303,7 +311,10 @@ def vlm_stream_generator(
     image_processor,
     max_tokens,
     temperature,
+    **kwargs,
 ):
+    stop_words = kwargs.pop("stop_words", [])
+
     for token in vlm_stream_generate(
         model,
         processor,
@@ -313,6 +324,12 @@ def vlm_stream_generator(
         max_tokens=max_tokens,
         temp=temperature,
     ):
+        # replace all stop words inside token with empty string
+        if stop_words:
+            for sw in stop_words:
+                if sw in token:
+                    token = token.replace(sw,'')
+
         chunk = ChatCompletionChunk(
             id=f"chatcmpl-{os.urandom(4).hex()}",
             created=int(time.time()),
@@ -386,10 +403,13 @@ def lm_stream_generator(
     stop_words = kwargs.pop("stop_words", [])
 
     for token in lm_stream_generate(
-        model, tokenizer, prompt, max_tokens=max_tokens, temp=temperature
+        model, tokenizer, prompt, max_tokens=max_tokens, temp=temperature,
     ):
-        if stop_words and token in stop_words:
-            break
+        # replace all stop words inside token with empty string
+        if stop_words:
+            for sw in stop_words:
+                if sw in token:
+                    token = token.replace(sw,'')
 
         chunk = ChatCompletionChunk(
             id=f"chatcmpl-{os.urandom(4).hex()}",

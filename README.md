@@ -18,25 +18,22 @@
 - **Efficient Resource Management**: Optimized for high-performance and scalability.
 - **Error Handling**: Robust error management for production environments.
 - **Customizable**: Easily extendable to accommodate specific use cases and model types.
+- **Memory Efficient For Local Deployment**: Unused models get unloaded from the memory after specified time of inactivity.
+- **Open WebUi Compliant**: Lists all MLX models in the HuggingFace cache, also custom models can be added
 
 ## Usage
 
 1. **Installation**
 
    ```bash
-   pip install fastmlx
+   git clone https://github.com/viljark/fastmlx.git
    ```
 
 2. **Running the Server**
 
    Start the FastMLX server:
    ```bash
-   fastmlx
-   ```
-   or
-
-   ```bash
-   uvicorn fastmlx:app --reload --workers 0
+   python -m fastmlx.fastmlx --workers 1
    ```
 
    > [!WARNING]
