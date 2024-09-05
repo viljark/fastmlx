@@ -2,18 +2,25 @@
 
 import argparse
 import asyncio
+from datetime import datetime
+import gc
+import hashlib
+import json
 import os
-from typing import Any, Dict, List
+import time
+import mlx
+from typing import Any, Dict, List, Generator
 from urllib.parse import unquote
-
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from huggingface_hub import scan_cache_dir
 
 from .types.chat.chat_completion import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
+    CompletionRequest,
 )
 from .types.model import SupportedModels
 
@@ -40,12 +47,50 @@ try:
 except ImportError:
     print("Warning: mlx or mlx_lm not available. Some functionality will be limited.")
     MLX_AVAILABLE = False
+import time
+from typing import Callable
 
+from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi.routing import APIRoute
+
+
+class TimedRoute(APIRoute):
+    def get_route_handler(self) -> Callable:
+        original_route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request) -> Response:
+            before = time.time()
+            response: Response = await original_route_handler(request)
+            duration = time.time() - before
+            response.headers["X-Response-Time"] = str(duration)
+            print(f"route duration: {duration}")
+                    # Pretty-print the JSON response
+            if response.headers.get('Content-Type') == 'application/json':
+                try:
+                    print('response', json.dumps(response.body.decode(), indent=4))
+                except json.JSONDecodeError:
+                    print(f"Response is not valid JSON: {response.text()}")
+            else:
+                print(f"Response is not JSON: {response.headers.get('Content-Type')}")
+            print(f"route response headers: {response.headers}")    
+            # print(f"route response headers: {response.headers}")
+            return response
+
+        return custom_route_handler
+        
+
+app = FastAPI()
+router = APIRouter(route_class=TimedRoute)
 
 class ModelProvider:
     def __init__(self):
         self.models: Dict[str, Dict[str, Any]] = {}
         self.lock = asyncio.Lock()
+        self.last_access_times = {}
+        self.generating_count: Dict[str, int] = {}
+        self.settings: Dict[str, int] = {
+            'keep_alive': 5,
+        }
 
     def load_model(self, model_name: str):
         if model_name not in self.models:
@@ -55,6 +100,11 @@ class ModelProvider:
                 self.models[model_name] = load_vlm_model(model_name, config)
             else:
                 self.models[model_name] = load_lm_model(model_name, config)
+            self.generating_count[model_name] = 0
+            # Update last access time for the loaded model
+
+        # Update last access time for the requested model
+        self.last_access_times[model_name] = time.time()
 
         return self.models[model_name]
 
@@ -62,15 +112,80 @@ class ModelProvider:
         async with self.lock:
             if model_name in self.models:
                 del self.models[model_name]
+                del self.last_access_times[model_name]
+                del self.generating_count[model_name]
+                print(f"Unloaded model {model_name}")
+                gc.collect()  # Force garbage collection
+                mlx.core.metal.clear_cache()
                 return True
             return False
+
+    async def unload_inactive_models(self):
+        while True:
+            current_time = time.time()
+
+            models_to_unload = [
+                    model_name for model_name, last_access in self.last_access_times.items()
+                    if current_time - last_access > (self.settings['keep_alive'] * 60) and self.generating_count.get(model_name, 0) == 0
+                ]
+            tasks = [self.remove_model(model_name) for model_name in models_to_unload]
+            await asyncio.gather(*tasks)
+            await asyncio.sleep(30)
 
     async def get_available_models(self):
         async with self.lock:
             return list(self.models.keys())
+        
+    def get_hf_cache_models(self) -> List[Dict[str, str]]:
+        hf_cache_info = scan_cache_dir()
+        models = []
+        for repo in sorted(hf_cache_info.repos, key=lambda repo: repo.repo_path):
+            if any(pattern in repo.repo_id.lower() for pattern in ["MLX", "mlx", "4bit", "8bit"]):
+                models.append({
+                    "id": repo.repo_id,
+                    "object": "model",
+                    "type": repo.repo_type,
+                    "size": "{:>12}".format(repo.size_on_disk_str),
+                    "nb_files": repo.nb_files,
+                    "last_accessed": repo.last_accessed_str,
+                    "last_modified": repo.last_modified_str,
+                    "local_path": str(repo.repo_path)
+                })
+        # add custom models which are manually quantizized
+        # TODO: add custom model parsing from ./models folder
+        models.append({
+            "id": "Big-Tiger-Gemma-27B-v1-mlx-4bit",
+            "object": "model",
+            "type": "",
+            "size": "15G",
+            "nb_files": 0,
+            "last_accessed": "N/A",
+            "last_modified": "N/A",
+            "local_path": './models/Big-Tiger-Gemma-27B-v1-mlx-4bit',
+        })
 
+        return models
+    
+    def start_generating(self, model_name: str):
+        self.generating_count[model_name] = self.generating_count.get(model_name, 0) + 1
+        print(f"Generating {model_name} ({self.generating_count[model_name]})")
 
-app = FastAPI()
+    def stop_generating(self, model_name: str):
+        if model_name in self.generating_count:
+            self.generating_count[model_name] = max(0, self.generating_count[model_name] - 1)
+            print(f"Stopping generation of {model_name}, {self.generating_count[model_name]}")
+
+    def stream_wrapper(self, model_name: str, generator: Generator) -> Generator:
+        try:
+            yield from generator
+        finally:
+            self.stop_generating(model_name)
+
+    def set_keep_alive(self, keep_alive: int = 0):
+        print("Setting keep alive to", keep_alive)
+        self.settings['keep_alive'] = keep_alive
+
+model_provider = ModelProvider()
 
 
 # Custom type function
@@ -105,14 +220,82 @@ def setup_cors(app: FastAPI, allowed_origins: List[str]):
     )
 
 
-# Initialize the ModelProvider
-model_provider = ModelProvider()
 
+@app.on_event("startup")
+async def startup_event():
+    print("Starting unload_inactive_models task")
+    asyncio.create_task(model_provider.unload_inactive_models())
+def get_keys(dictionary):
+    keys = []
+    if isinstance(dictionary, list):
+        for item in dictionary:
+            keys.extend(get_keys(item))
+    elif isinstance(dictionary, dict):
+        for key in dictionary:
+            keys.append({'key', dictionary[key][:10]})
+            keys.extend(get_keys(dictionary[key]))
+    return keys
+print
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def chat_completion(request: ChatCompletionRequest):
+@router.post("/v1/completions", response_model=ChatCompletionResponse)
+async def completions(request: CompletionRequest):
     if not MLX_AVAILABLE:
         raise HTTPException(status_code=500, detail="MLX library not available")
+
+    # For simplicity, let's assume the request is similar to the chat completion request
+    # and we'll use the same logic for generating the completion.
+    # You might need to adjust the logic based on the actual requirements of the completions endpoint.
+
+    model_data = model_provider.load_model(request.model)
+    model = model_data["model"]
+    config = model_data["config"]
+    model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
+
+    if model_type in MODELS["vlm"]:
+        # Implementation for VLM model for completions
+        pass
+    else:
+        # Implementation for LM model for completions
+        tokenizer = model_data["tokenizer"]
+        prompt = request.prompt  # Assuming the prompt is part of the request
+
+        # Generate the completion
+        output = lm_generate(
+            model,
+            tokenizer,
+            prompt,
+            request.max_tokens,
+            temp=request.temperature,
+            stop_words=get_eom_token(request.model),
+        )
+
+        # Prepare the response
+        response = ChatCompletionResponse(
+            id=f"cmpl-{os.urandom(16).hex()}",
+            object="text_completion",
+            created=int(time.time()),
+            model=request.model,
+            choices=[
+                {
+                    "text": output,
+                    "index": 0,
+                    "logprobs": None,
+                    "finish_reason": "stop",
+                }
+            ],
+        )
+
+        return response
+    
+@router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def chat_completion(request: ChatCompletionRequest):
+
+    if not MLX_AVAILABLE:
+        raise HTTPException(status_code=500, detail="MLX library not available")
+
+    if "gemma-2" in request.model.lower():
+        # Remove system role messages for gemma-2 model
+        request.messages = [msg for msg in request.messages if msg.role!= "system"]
 
     stream = request.stream
     model_data = model_provider.load_model(request.model)
@@ -120,20 +303,38 @@ async def chat_completion(request: ChatCompletionRequest):
     config = model_data["config"]
     model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
     stop_words = get_eom_token(request.model)
+    model_provider.start_generating(request.model)
 
     if model_type in MODELS["vlm"]:
         processor = model_data["processor"]
         image_processor = model_data["image_processor"]
 
-        image = request.image
+        # Set image from the latest message if found
+        # TODO: not working as expected
+        image = None
+        for message in reversed(request.messages):
+            for item in message.content:
+                if 'image_url' in item:
+                    image = item['image_url']['url']
+                    break  # Stop searching once the image URL is found
+                else:
+                    continue  # Continue to the next message if no image URL is found in this message
+            break  # Stop looping through messages once an image URL is found
 
         chat_messages = []
 
         for msg in request.messages:
-            if msg.role == "user":
-                chat_messages.append(msg.content)
+            content = []
+            if isinstance(msg.content, list):
+                # Handle image_url in content
+                for item in msg.content:
+                    if item["type"] == "text":
+                        content.append(item["text"])
             else:
-                chat_messages.append({"role": msg.role, "content": msg.content})
+                content = msg.content
+            chat_messages.append({"role": msg.role, "content": content})
+
+        print(chat_messages)
 
         prompt = ""
         if model.config.model_type != "paligemma":
@@ -142,17 +343,20 @@ async def chat_completion(request: ChatCompletionRequest):
             prompt = request.messages[-1].content
 
         if stream:
-            return StreamingResponse(
-                vlm_stream_generator(
+            generator = vlm_stream_generator(
                     model,
                     request.model,
                     processor,
-                    request.image,
+                    image,
                     prompt,
                     image_processor,
                     request.max_tokens,
                     request.temperature,
-                ),
+                    stop_words=stop_words,
+                )
+
+            return StreamingResponse(
+                model_provider.stream_wrapper(request.model, generator),
                 media_type="text/event-stream",
             )
         else:
@@ -198,8 +402,7 @@ async def chat_completion(request: ChatCompletionRequest):
         prompt = apply_lm_chat_template(tokenizer, chat_messages, request)
 
         if stream:
-            return StreamingResponse(
-                lm_stream_generator(
+                generator = lm_stream_generator(
                     model,
                     request.model,
                     tokenizer,
@@ -207,9 +410,11 @@ async def chat_completion(request: ChatCompletionRequest):
                     request.max_tokens,
                     request.temperature,
                     stop_words=stop_words,
-                ),
-                media_type="text/event-stream",
-            )
+                )
+                return StreamingResponse(
+                    model_provider.stream_wrapper(request.model, generator),
+                    media_type="text/event-stream",
+                )
         else:
             output = lm_generate(
                 model,
@@ -221,8 +426,76 @@ async def chat_completion(request: ChatCompletionRequest):
             )
 
     # Parse the output to check for function calls
-    return handle_function_calls(output, request)
+    result = handle_function_calls(output, request)
+    model_provider.stop_generating(request.model)
 
+    return result
+
+@router.head("/")
+async def head():
+    return 'fast-mlx is running'
+
+@router.get("/")
+async def index():
+
+    return 'fast-mlx is running'
+
+def convert_size_to_bytes(size_string):
+    # Remove any whitespace and convert to uppercase
+    size_string = size_string.strip().upper()
+    
+    # Extract the numeric part and the unit
+    number = float(size_string[:-1])
+    unit = size_string[-1]
+    
+    if unit == 'G':
+        return int(number * 1e6)  # 1 billion
+    else:
+        raise ValueError("Unsupported unit. Expected 'B' for billion.")
+
+# shoul be ollama compliant, but enchanted is still not picking it up
+@router.get("/api/tags")
+async def get_tags():
+    hf_cache_models = model_provider.get_hf_cache_models()
+    
+    models = []
+    for model in hf_cache_models:
+        # Generate a pseudo-digest using the model id
+        digest = hashlib.sha256(model['id'].encode()).hexdigest()
+        
+        # Parse the last_modified date
+        try:
+            modified_at = datetime.strptime(model['last_modified'], "%Y-%m-%d %H:%M:%S").isoformat()
+        except ValueError:
+            modified_at = datetime.now().isoformat()  # Use current time if parsing fails
+        
+        # Extract parameter size and quantization level from the model id
+        parameter_size = "Unknown"
+        quantization_level = "Unknown"
+        if "-" in model['id']:
+            parts = model['id'].split("-")
+            for part in parts:
+                if part.endswith("B"):
+                    parameter_size = part
+                elif part.startswith("Q"):
+                    quantization_level = part
+        
+        models.append({
+            "name": model['id'],
+            "model": model['id'],
+            "modified_at": modified_at,
+            "size": convert_size_to_bytes(model["size"]),
+            "digest": digest,
+            "details": {
+                "format": "gguf",  # Assuming GGUF format for all models
+                "family": "llama" if "llama" in model['id'].lower() else "unknown",
+                "families": None,
+                "parameter_size": parameter_size,
+                "quantization_level": quantization_level
+            }
+        })
+    
+    return {"models": models}
 
 @app.get("/v1/supported_models", response_model=SupportedModels)
 async def get_supported_models():
@@ -234,8 +507,12 @@ async def get_supported_models():
 
 @app.get("/v1/models")
 async def list_models():
-    return {"models": await model_provider.get_available_models()}
-
+    models = model_provider.get_hf_cache_models()
+    print(models)
+    return {
+        "object": "list",
+        "data": models
+    }
 
 @app.post("/v1/models")
 async def add_model(model_name: str):
@@ -292,10 +569,20 @@ def run():
         --workers 0.0 (will use 1 worker)""",
     )
 
+    
+    parser.add_argument(
+        "--keep-alive",
+        type=int,
+        default=0,
+        help="Time in minutes to keep models loaded after last access. 0 means no unloading."
+    )
+
     args = parser.parse_args()
     if isinstance(args.workers, float):
         args.workers = max(1, int(os.cpu_count() * args.workers))
 
+    # does not work, second thread not picking up the updated value, hardcoded to 5 in ModelProvider
+    model_provider.set_keep_alive(args.keep_alive)
     setup_cors(app, args.allowed_origins)
 
     import uvicorn
@@ -307,8 +594,12 @@ def run():
         reload=args.reload,
         workers=args.workers,
         loop="asyncio",
+        lifespan="on"
     )
 
 
 if __name__ == "__main__":
     run()
+
+
+app.include_router(router)
