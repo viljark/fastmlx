@@ -288,7 +288,7 @@ async def completions(request: CompletionRequest):
         prompt = request.prompt  # Assuming the prompt is part of the request
 
         # Generate the completion
-        output = lm_generate(
+        output, token_length_info  = lm_generate(
             model,
             tokenizer,
             prompt,
@@ -303,6 +303,7 @@ async def completions(request: CompletionRequest):
             object="text_completion",
             created=int(time.time()),
             model=request.model,
+            usage=token_length_info,
             choices=[
                 {
                     "text": output,
