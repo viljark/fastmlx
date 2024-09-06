@@ -440,7 +440,7 @@ def lm_generate(
 
 
 def lm_stream_generator(
-    model, model_name, tokenizer, prompt, max_tokens, temperature, stream_options, **kwargs
+    model, model_name, tokenizer, prompt, max_tokens, temperature, stream_options, legacy=False, **kwargs
 ):
     INCLUDE_USAGE = (
         False if stream_options == None else stream_options.get("include_usage", False)
@@ -461,19 +461,25 @@ def lm_stream_generator(
                 # Update token length info
         if INCLUDE_USAGE:
             completion_tokens += 1
-
+        choices = [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": token},
+                    "finish_reason": None,
+                } if not legacy else {
+                "index": 0,
+                "text": token,
+                "logprobs": None,
+                "finish_reason": None,
+            }
+        ]
+        print(choices)
         chunk = ChatCompletionChunk(
             id=f"chatcmpl-{os.urandom(4).hex()}",
             created=int(time.time()),
             model=model_name,
             usage=empty_usage,
-            choices=[
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": token},
-                    "finish_reason": None,
-                }
-            ],
+            choices=choices,
         )
         yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 

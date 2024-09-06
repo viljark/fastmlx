@@ -93,8 +93,9 @@ class ModelProvider:
         }
 
     def load_model(self, model_name: str):
+        #TODO: need to make it shared between parallel api requests
         if model_name not in self.models:
-
+            print('WARNING: loading model again into self.models, this should be avoided', model_name)
             models = self.get_cached_and_local_models()
 
             for model in models:
@@ -270,15 +271,13 @@ async def completions(request: CompletionRequest):
     if not MLX_AVAILABLE:
         raise HTTPException(status_code=500, detail="MLX library not available")
 
-    # For simplicity, let's assume the request is similar to the chat completion request
-    # and we'll use the same logic for generating the completion.
-    # You might need to adjust the logic based on the actual requirements of the completions endpoint.
-
+    stream = request.stream
     model_data = model_provider.load_model(request.model)
     model = model_data["model"]
     config = model_data["config"]
     model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
 
+    stop_words = get_eom_token(request.model)
     if model_type in MODELS["vlm"]:
         # Implementation for VLM model for completions
         pass
@@ -294,25 +293,44 @@ async def completions(request: CompletionRequest):
             prompt,
             request.max_tokens,
             temp=request.temperature,
-            stop_words=get_eom_token(request.model),
+            stop_words=stop_words,
         )
 
-        # Prepare the response
-        response = ChatCompletionResponse(
-            id=f"cmpl-{os.urandom(16).hex()}",
-            object="text_completion",
-            created=int(time.time()),
-            model=request.model,
-            usage=token_length_info,
-            choices=[
-                {
-                    "text": output,
-                    "index": 0,
-                    "logprobs": None,
-                    "finish_reason": "stop",
-                }
-            ],
-        )
+        if stream:
+            generator = lm_stream_generator(
+                model,
+                request.model,
+                tokenizer,
+                prompt,
+                request.max_tokens,
+                request.temperature,
+                legacy=True,
+                stop_words=stop_words,
+                stream_options=request.stream_options,
+            )
+            return StreamingResponse(
+                model_provider.stream_wrapper(request.model, generator),
+                media_type="text/event-stream",
+            )
+        else:
+            # Prepare the response
+            response = ChatCompletionResponse(
+                id=f"cmpl-{os.urandom(16).hex()}",
+                object="text_completion",
+                created=int(time.time()),
+                model=request.model,
+                usage=token_length_info,
+                choices=[
+                    {
+                        "text": output,
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": "stop",
+                    }
+                ],
+            )
+
+        model_provider.stop_generating(request.model)
 
         return response
     

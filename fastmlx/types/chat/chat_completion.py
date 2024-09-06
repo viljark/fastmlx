@@ -77,3 +77,4 @@ class CompletionRequest(BaseModel):
     frequency_penalty: float = Field(default=0.0)
     best_of: int = Field(default=1, ge=1, le=10)
     user: str = Field(default="")
+    stream_options: Optional[Dict[str, Any]] = Field(default={ "include_usage": True })
