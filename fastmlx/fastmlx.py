@@ -90,37 +90,50 @@ class ModelProvider:
         self.generating_count: Dict[str, int] = {}
         self.settings: Dict[str, int] = {
             'keep_alive': 5,
+            'max_loaded_models': 1,
         }
 
-    def load_model(self, model_name: str):
-        #TODO: need to queue api requests
-        model_id = model_name
-        if model_name not in self.models:
-            print('WARNING: loading model again into self.models, this should be avoided', model_name)
-            models = self.get_cached_and_local_models()
+    def is_model_loaded(self, model_name: str) -> bool:
+        return model_name in self.models
 
-            for model in models:
-                if model["id"] == model_name:
-                    model_name = model["local_path"] if model["local_path"].startswith("./models") else model_name
-                    model_id = model["id"]
-                    break
-
-            config = load_config(model_name)
-            model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
-            if model_type in MODELS["vlm"]:
-                self.models[model_id] = load_vlm_model(model_name, config)
-            else:
-                self.models[model_id] = load_lm_model(model_name, config)
-            self.generating_count[model_id] = 0
-            # Update last access time for the loaded model
-
-        # Update last access time for the requested model
-        self.last_access_times[model_id] = time.time()
-
-        return self.models[model_id]
-
-    async def remove_model(self, model_name: str) -> bool:
+    async def load_model(self, model_name: str):
         async with self.lock:
+            model_id = model_name
+            if model_name not in self.models:
+                print('loading model:', model_name)
+                if len(self.models) >= self.settings['max_loaded_models']:
+                    models_to_remove = [loaded_model_name for loaded_model_name in self.models.keys()]
+                    for loaded_model_name in models_to_remove:
+                        while self.generating_count[loaded_model_name] > 0:
+                            print('waiting for model to finish generating', loaded_model_name, self.generating_count[loaded_model_name])
+                            await asyncio.sleep(1)
+                        print('unloading idle model', loaded_model_name)
+                        await self.remove_model(loaded_model_name, no_lock= True)
+
+                models = self.get_cached_and_local_models()
+
+                for model in models:
+                    if model["id"] == model_name:
+                        model_name = model["local_path"] if model["local_path"].startswith("./models") else model_name
+                        model_id = model["id"]
+                        break
+
+                config = load_config(model_name)
+                model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
+                if model_type in MODELS["vlm"]:
+                    self.models[model_id] = load_vlm_model(model_name, config)
+                else:
+                    self.models[model_id] = load_lm_model(model_name, config)
+                self.generating_count[model_id] = 0
+                # Update last access time for the loaded model
+
+            # Update last access time for the requested model
+            self.last_access_times[model_id] = time.time()
+
+            return self.models[model_id]
+
+    async def remove_model(self, model_name: str, no_lock = False) -> bool:
+        def remove() -> bool:
             if model_name in self.models:
                 del self.models[model_name]
                 del self.last_access_times[model_name]
@@ -130,6 +143,11 @@ class ModelProvider:
                 mlx.core.metal.clear_cache()
                 return True
             return False
+        if (no_lock):
+            return remove()
+        else: 
+            async with self.lock:
+                return remove()
 
     async def unload_inactive_models(self):
         while True:
@@ -273,7 +291,7 @@ async def completions(request: CompletionRequest):
         raise HTTPException(status_code=500, detail="MLX library not available")
 
     stream = request.stream
-    model_data = model_provider.load_model(request.model)
+    model_data = await model_provider.load_model(request.model)
     model = model_data["model"]
     config = model_data["config"]
     model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
@@ -346,7 +364,7 @@ async def chat_completion(request: ChatCompletionRequest):
         request.messages = [msg for msg in request.messages if msg.role!= "system"]
 
     stream = request.stream
-    model_data = model_provider.load_model(request.model)
+    model_data = await model_provider.load_model(request.model)
     model = model_data["model"]
     config = model_data["config"]
     model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])

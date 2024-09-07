@@ -473,7 +473,6 @@ def lm_stream_generator(
                 "finish_reason": None,
             }
         ]
-        print(choices)
         chunk = ChatCompletionChunk(
             id=f"chatcmpl-{os.urandom(4).hex()}",
             created=int(time.time()),
@@ -496,5 +495,28 @@ def lm_stream_generator(
             ),
         )
         yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-        
+    stop_choices = [
+        {
+            "index": 0,
+            "delta": {"role": "assistant", "content": token},
+            "finish_reason": "length",
+        } if not legacy else {
+        "index": 0,
+        "text": '',
+        "logprobs": None,
+        "finish_reason": "length",
+    }]
+    
+    stop_chunk = ChatCompletionChunk(
+        id=f"chatcmpl-{os.urandom(4).hex()}",
+        created=int(time.time()),
+        model=model_name,
+        choices=stop_choices,
+        usage=Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+    )
+    yield f"data: {json.dumps(stop_chunk.model_dump())}\n\n"
     yield "data: [DONE]\n\n"
