@@ -93,7 +93,8 @@ class ModelProvider:
         }
 
     def load_model(self, model_name: str):
-        #TODO: need to make it shared between parallel api requests
+        #TODO: need to queue api requests
+        model_id = model_name
         if model_name not in self.models:
             print('WARNING: loading model again into self.models, this should be avoided', model_name)
             models = self.get_cached_and_local_models()
@@ -101,21 +102,22 @@ class ModelProvider:
             for model in models:
                 if model["id"] == model_name:
                     model_name = model["local_path"] if model["local_path"].startswith("./models") else model_name
+                    model_id = model["id"]
                     break
 
             config = load_config(model_name)
             model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
             if model_type in MODELS["vlm"]:
-                self.models[model_name] = load_vlm_model(model_name, config)
+                self.models[model_id] = load_vlm_model(model_name, config)
             else:
-                self.models[model_name] = load_lm_model(model_name, config)
-            self.generating_count[model_name] = 0
+                self.models[model_id] = load_lm_model(model_name, config)
+            self.generating_count[model_id] = 0
             # Update last access time for the loaded model
 
         # Update last access time for the requested model
-        self.last_access_times[model_name] = time.time()
+        self.last_access_times[model_id] = time.time()
 
-        return self.models[model_name]
+        return self.models[model_id]
 
     async def remove_model(self, model_name: str) -> bool:
         async with self.lock:
@@ -247,7 +249,6 @@ def setup_cors(app: FastAPI, allowed_origins: List[str]):
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
 
 
 @app.on_event("startup")
