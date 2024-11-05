@@ -330,6 +330,7 @@ def vlm_stream_generator(
     empty_usage: Usage = None
 
     stop_words = kwargs.pop("stop_words", [])
+    completion_id = f"chatcmpl-{os.urandom(4).hex()}"
 
     for token in vlm_stream_generate(
         model,
@@ -351,7 +352,7 @@ def vlm_stream_generator(
                     token = token.replace(sw,'')
 
         chunk = ChatCompletionChunk(
-            id=f"chatcmpl-{os.urandom(4).hex()}",
+            id=completion_id,
             created=int(time.time()),
             model=model_name,
             usage=empty_usage,
@@ -366,7 +367,7 @@ def vlm_stream_generator(
         yield f"data: {json.dumps(chunk.model_dump())}\n\n"
     if INCLUDE_USAGE:
         chunk = ChatCompletionChunk(
-            id=f"chatcmpl-{os.urandom(4).hex()}",
+            id=completion_id,
             created=int(time.time()),
             model=model_name,
             choices=[],
@@ -449,7 +450,7 @@ def lm_stream_generator(
     completion_tokens = 0
     empty_usage: Usage = None
     stop_words = kwargs.pop("stop_words", [])
-
+    completion_id = f"chatcmpl-{os.urandom(4).hex()}"
     for token in lm_stream_generate(
         model, tokenizer, prompt, max_tokens=max_tokens, temp=temperature,
     ):
@@ -474,7 +475,7 @@ def lm_stream_generator(
             }
         ]
         chunk = ChatCompletionChunk(
-            id=f"chatcmpl-{os.urandom(4).hex()}",
+            id=completion_id,
             created=int(time.time()),
             model=model_name,
             usage=empty_usage,
@@ -484,7 +485,7 @@ def lm_stream_generator(
 
     if INCLUDE_USAGE:
         chunk = ChatCompletionChunk(
-            id=f"chatcmpl-{os.urandom(4).hex()}",
+            id=completion_id,
             created=int(time.time()),
             model=model_name,
             choices=[],
@@ -498,13 +499,13 @@ def lm_stream_generator(
     stop_choices = [
         {
             "index": 0,
-            "delta": {"role": "assistant", "content": token},
-            "finish_reason": "length",
+            "delta": {"role": "assistant", "content": ''},
+            "finish_reason": "stop",
         } if not legacy else {
         "index": 0,
         "text": '',
         "logprobs": None,
-        "finish_reason": "length",
+        "finish_reason": "stop",
     }]
     
     stop_chunk = ChatCompletionChunk(
