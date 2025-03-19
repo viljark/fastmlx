@@ -32,6 +32,13 @@ try:
 except ImportError:
     print("Warning: mlx or mlx_lm not available. Some functionality will be limited.")
 
+import logging
+import pprint
+
+# Set up logging if you haven't already
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 
 TOOLS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "tools"))
 
@@ -291,7 +298,7 @@ def handle_function_calls(
 
 # Model Loading and Generation Functions
 def load_vlm_model(model_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    model, processor = vlm_load(model_name, {"trust_remote_code": True})
+    model, processor = vlm_load(model_name, None, {"trust_remote_code": True})
     image_processor = load_image_processor(model_name)
     return {
         "model": model,
@@ -306,6 +313,20 @@ def load_lm_model(model_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
     model, tokenizer = lm_load(model_name, model_config=config)
     print(f"Model loaded in {time.time() - time_start:.2f} seconds.")
     return {"model": model, "tokenizer": tokenizer, "config": config}
+
+# Create a custom function to handle the GenerationResponse serialization
+def serialize_generation_response(obj: ChatCompletionChunk):
+    if len(obj['choices']) > 0:
+        obj['choices'][0]['delta']['content'] = obj['choices'][0]['delta']['content']['text']
+        return obj
+    else:
+        return obj
+
+
+
+def prepare_chunk_for_json(chunk: ChatCompletionChunk):
+    chunk_dict = chunk.model_dump()
+    return serialize_generation_response(chunk_dict)
 
 
 def vlm_stream_generator(
@@ -331,13 +352,13 @@ def vlm_stream_generator(
 
     stop_words = kwargs.pop("stop_words", [])
     completion_id = f"chatcmpl-{os.urandom(4).hex()}"
-
+    tic = time.perf_counter()
     for token in vlm_stream_generate(
         model,
         processor,
-        image,
         prompt,
-        image_processor,
+        image,
+        image_processor=image_processor,
         max_tokens=max_tokens,
         temp=temperature,
     ):
@@ -364,7 +385,9 @@ def vlm_stream_generator(
                 }
             ],
         )
-        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+        yield f"data: {json.dumps(prepare_chunk_for_json(chunk))}\n\n"
+    gen_time = time.perf_counter() - tic
+    gen_tps = (completion_tokens - 1) / gen_time
     if INCLUDE_USAGE:
         chunk = ChatCompletionChunk(
             id=completion_id,
@@ -372,12 +395,14 @@ def vlm_stream_generator(
             model=model_name,
             choices=[],
             usage=Usage(
+                gen_tps=f"{gen_tps:.1f}t/s",
+                gen_time=f"{gen_time:.1f}s",
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
             ),
         )
-        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+        yield f"data: {json.dumps(prepare_chunk_for_json(chunk))}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -417,7 +442,7 @@ def lm_generate(
     detokenizer = tokenizer.detokenizer
 
     detokenizer.reset()
-
+    tic = time.perf_counter()
     for (token, logprobs), n in zip(
         generate_step(prompt_tokens, model, **kwargs),
         range(max_tokens),
@@ -430,9 +455,13 @@ def lm_generate(
         detokenizer.add_token(token)
 
     detokenizer.finalize()
-    
+
     _completion_tokens = len(detokenizer.tokens)
+    gen_time = time.perf_counter() - tic
+    gen_tps = (_completion_tokens - 1) / gen_time
     token_length_info: Usage = Usage(
+        gen_tps=f"{gen_tps:.1f}t/s",
+        gen_time=f"{gen_time:.1f}s",
         prompt_tokens=prompt_token_len,
         completion_tokens=_completion_tokens,
         total_tokens=prompt_token_len + _completion_tokens,
@@ -451,8 +480,9 @@ def lm_stream_generator(
     empty_usage: Usage = None
     stop_words = kwargs.pop("stop_words", [])
     completion_id = f"chatcmpl-{os.urandom(4).hex()}"
+    tic = time.perf_counter()
     for token in lm_stream_generate(
-        model, tokenizer, prompt, max_tokens=max_tokens, temp=temperature,
+        model, tokenizer, prompt, max_tokens=max_tokens,
     ):
         # replace all stop words inside token with empty string
         if stop_words:
@@ -481,25 +511,32 @@ def lm_stream_generator(
             usage=empty_usage,
             choices=choices,
         )
-        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+
+        yield f"data: {json.dumps(prepare_chunk_for_json(chunk))}\n\n"
 
     if INCLUDE_USAGE:
+        gen_time = time.perf_counter() - tic
+        gen_tps = (completion_tokens - 1) / gen_time
+
+        print(f"Generation: {gen_tps:.1f} tokens-per-sec ")
         chunk = ChatCompletionChunk(
             id=completion_id,
             created=int(time.time()),
             model=model_name,
             choices=[],
             usage=Usage(
+                gen_tps=f"{gen_tps:.1f}t/s",
+                gen_time=f"{gen_time:.1f}s",
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
             ),
         )
-        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+        yield f"data: {json.dumps(prepare_chunk_for_json(chunk))}\n\n"
     stop_choices = [
         {
             "index": 0,
-            "delta": {"role": "assistant", "content": ''},
+            "delta": {"role": "assistant", "content": {'text': ''}},
             "finish_reason": "stop",
         } if not legacy else {
         "index": 0,
@@ -509,15 +546,10 @@ def lm_stream_generator(
     }]
     
     stop_chunk = ChatCompletionChunk(
-        id=f"chatcmpl-{os.urandom(4).hex()}",
+        id=completion_id,
         created=int(time.time()),
         model=model_name,
         choices=stop_choices,
-        usage=Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
     )
-    yield f"data: {json.dumps(stop_chunk.model_dump())}\n\n"
+    yield f"data: {json.dumps(prepare_chunk_for_json(stop_chunk))}\n\n"
     yield "data: [DONE]\n\n"

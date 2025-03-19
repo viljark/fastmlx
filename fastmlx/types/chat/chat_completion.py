@@ -28,6 +28,8 @@ class ImageURL(BaseModel):
     url: str
 
 class Usage(BaseModel):
+    gen_tps: str
+    gen_time: str
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int

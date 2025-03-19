@@ -186,7 +186,7 @@ class ModelProvider:
                 "id": folder,
                 "object": "model",
                 "type": "",
-                "size": f"{total_size_gb:.2f}GB",
+                "size": f"{total_size_gb:.2f}G",
                 "nb_files": 0,  # Assuming nb_files is not directly available in the folder
                 "last_accessed": "N/A",  # Assuming last_accessed is not directly available in the folder
                 "last_modified": "N/A",  # Assuming last_modified is not directly available in the folder
@@ -311,7 +311,6 @@ async def completions(request: CompletionRequest):
             tokenizer,
             prompt,
             request.max_tokens,
-            temp=request.temperature,
             stop_words=stop_words,
         )
 
@@ -415,8 +414,8 @@ async def chat_completion(request: ChatCompletionRequest):
                     image,
                     prompt,
                     image_processor,
-                    request.max_tokens,
-                    request.temperature,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
                     stop_words=stop_words,
                     stream_options=request.stream_options,
                 )
@@ -432,7 +431,6 @@ async def chat_completion(request: ChatCompletionRequest):
                 processor,
                 image,
                 prompt,
-                image_processor,
                 max_tokens=request.max_tokens,
                 temp=request.temperature,
                 verbose=False,
@@ -488,7 +486,6 @@ async def chat_completion(request: ChatCompletionRequest):
                 tokenizer,
                 prompt,
                 request.max_tokens,
-                temp=request.temperature,
                 stop_words=stop_words,
             )
 
@@ -514,19 +511,18 @@ def convert_size_to_bytes(size_string):
     # Extract the numeric part and the unit
     number = float(size_string[:-1])
     unit = size_string[-1]
-    
     if unit == 'G':
-        return int(number * 1e6)  # 1 billion
+        return int(number * 1e6)  # 1 gb
     else:
-        raise ValueError("Unsupported unit. Expected 'B' for billion.")
+        raise ValueError("Unsupported unit. Expected 'G' for gigabyte.")
 
 # shoul be ollama compliant, but enchanted is still not picking it up
-@router.get("/api/tags")
+@app.get("/api/tags")
 async def get_tags():
-    models = model_provider.get_cached_and_local_models()
+    raw_models = model_provider.get_cached_and_local_models()
     
     models = []
-    for model in models:
+    for model in raw_models:
         # Generate a pseudo-digest using the model id
         digest = hashlib.sha256(model['id'].encode()).hexdigest()
         
@@ -554,7 +550,7 @@ async def get_tags():
             "size": convert_size_to_bytes(model["size"]),
             "digest": digest,
             "details": {
-                "format": "gguf",  # Assuming GGUF format for all models
+                "format": "mlx",
                 "family": "llama" if "llama" in model['id'].lower() else "unknown",
                 "families": None,
                 "parameter_size": parameter_size,
