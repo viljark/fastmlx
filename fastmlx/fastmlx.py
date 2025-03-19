@@ -311,6 +311,7 @@ async def completions(request: CompletionRequest):
             tokenizer,
             prompt,
             request.max_tokens,
+            temp=request.temperature,
             stop_words=stop_words,
         )
 
@@ -486,6 +487,7 @@ async def chat_completion(request: ChatCompletionRequest):
                 tokenizer,
                 prompt,
                 request.max_tokens,
+                temp=request.temperature,
                 stop_words=stop_words,
             )
 
