@@ -318,7 +318,14 @@ def load_lm_model(model_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
 # Create a custom function to handle the GenerationResponse serialization
 def serialize_generation_response(obj: ChatCompletionChunk):
     if len(obj['choices']) > 0:
-        obj['choices'][0]['delta']['content'] = obj['choices'][0]['delta']['content']['text']
+        if 'delta' in obj['choices'][0]:
+            obj['choices'][0]['delta']['content'] = obj['choices'][0]['delta']['content']['text']
+        elif 'text' in obj['choices'][0]:
+            # Check if 'text' is a string or a dictionary
+            if isinstance(obj['choices'][0]['text'], str):
+                obj['choices'][0]['text'] = obj['choices'][0]['text']
+            else:
+                obj['choices'][0]['text'] = obj['choices'][0]['text']['text']
         return obj
     else:
         return obj
@@ -370,8 +377,16 @@ def vlm_stream_generator(
         # replace all stop words inside token with empty string
         if stop_words:
             for sw in stop_words:
-                if sw in token:
-                    token = token.replace(sw,'')
+                if isinstance(token, str):
+                    print(token)
+                    if sw in token:
+                        token = token.replace(sw, '')
+                elif hasattr(token, 'text') and isinstance(token.text, str):
+                    print(token.text)
+                    if sw in token.text:
+                        token.text = token.text.replace(sw, '')
+                else:
+                    raise TypeError("Token is neither a string nor a GenerationResult with a text attribute")
 
         chunk = ChatCompletionChunk(
             id=completion_id,
@@ -472,7 +487,7 @@ def lm_generate(
 
 
 def lm_stream_generator(
-    model, model_name, tokenizer, prompt, max_tokens, temperature, stream_options, legacy=False, **kwargs
+    model, model_name, tokenizer, prompt, max_tokens, temperature, stream_options, draft_model, legacy=False,  **kwargs
 ):
     INCLUDE_USAGE = (
         False if stream_options == None else stream_options.get("include_usage", False)
@@ -483,8 +498,9 @@ def lm_stream_generator(
     stop_words = kwargs.pop("stop_words", [])
     completion_id = f"chatcmpl-{os.urandom(4).hex()}"
     tic = time.perf_counter()
+
     for token in lm_stream_generate(
-        model, tokenizer, prompt, max_tokens=max_tokens,
+        model, tokenizer, prompt, max_tokens=max_tokens, draft_model=draft_model
     ):
         # replace all stop words inside token with empty string
         if stop_words:

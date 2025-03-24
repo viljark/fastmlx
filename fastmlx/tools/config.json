@@ -22,7 +22,7 @@
       "tool_role": "tool"
     },
     "default": {
-      "prompt_template": "llama3_1.j2",
+      "prompt_template": "llama-3_1.j2",
       "parallel_tool_calling": false
     }
   }

@@ -15,6 +15,10 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from huggingface_hub import scan_cache_dir
+from io import BytesIO
+import base64
+from PIL import Image
+
 
 from .types.chat.chat_completion import (
     ChatCompletionRequest,
@@ -90,7 +94,7 @@ class ModelProvider:
         self.generating_count: Dict[str, int] = {}
         self.settings: Dict[str, int] = {
             'keep_alive': 5,
-            'max_loaded_models': 1,
+            'max_loaded_models': 2,
         }
 
     def is_model_loaded(self, model_name: str) -> bool:
@@ -131,6 +135,21 @@ class ModelProvider:
             self.last_access_times[model_id] = time.time()
 
             return self.models[model_id]
+    
+    async def load_draft_model(self, model_name):
+        draft_model_map = {
+            "Qwen2.5-Coder": "mlx-community/Qwen2.5-Coder-0.5B-Instruct-4bit",
+            "QwQ": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+            "Mistral-Small-3.1": "cnfusion/Mistral-Small-3.1-DRAFT-0.5B-mlx-4Bit"
+        }
+        
+        for key, value in draft_model_map.items():
+            if key in model_name:
+                draft_model_data = await model_provider.load_model(value)
+                draft_model = draft_model_data["model"]
+                print(f'using draft model {value}')
+                return draft_model
+        return None
 
     async def remove_model(self, model_name: str, no_lock = False) -> bool:
         def remove() -> bool:
@@ -293,6 +312,7 @@ async def completions(request: CompletionRequest):
     stream = request.stream
     model_data = await model_provider.load_model(request.model)
     model = model_data["model"]
+    draft_model = await model_provider.load_draft_model(request.model)
     config = model_data["config"]
     model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
 
@@ -326,6 +346,7 @@ async def completions(request: CompletionRequest):
                 legacy=True,
                 stop_words=stop_words,
                 stream_options=request.stream_options,
+                draft_model=draft_model
             )
             return StreamingResponse(
                 model_provider.stream_wrapper(request.model, generator),
@@ -353,6 +374,30 @@ async def completions(request: CompletionRequest):
 
         return response
     
+def decode_base64_data_uri(data_uri: str) -> Image.Image:
+    """
+    Decodes a Base64 data URI and returns a PIL Image object.
+    
+    :param data_uri: The Base64 data URI to decode.
+    :return: A PIL Image object containing the decoded image data.
+    :raises ValueError: If the data URI is not a valid Base64 data URI.
+    """
+    if not data_uri.startswith("data:image/"):
+        raise ValueError("The provided URI is not a valid Base64 data URI.")
+    
+    try:
+        # Split the data URI into parts
+        header, encoded_data = data_uri.split(",", 1)
+        # Decode the Base64 data
+        image_data = base64.b64decode(encoded_data)
+        # Create a BytesIO object from the decoded data
+        image_source = BytesIO(image_data)
+        # Open the image using PIL
+        image = Image.open(image_source)
+        return image
+    except Exception as e:
+        raise ValueError(f"Failed to decode Base64 data URI: {data_uri} with error {e}") from e
+
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completion(request: ChatCompletionRequest):
 
@@ -366,6 +411,7 @@ async def chat_completion(request: ChatCompletionRequest):
     stream = request.stream
     model_data = await model_provider.load_model(request.model)
     model = model_data["model"]
+    draft_model = await model_provider.load_draft_model(request.model)
     config = model_data["config"]
     model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
     stop_words = get_eom_token(request.model)
@@ -375,44 +421,39 @@ async def chat_completion(request: ChatCompletionRequest):
         processor = model_data["processor"]
         image_processor = model_data["image_processor"]
 
-        # Set image from the latest message if found
-        # TODO: not working as expected
-        image = None
-        for message in reversed(request.messages):
-            for item in message.content:
-                if 'image_url' in item:
-                    image = item['image_url']['url']
-                    break  # Stop searching once the image URL is found
-                else:
-                    continue  # Continue to the next message if no image URL is found in this message
-            break  # Stop looping through messages once an image URL is found
-
+        image_url = None
         chat_messages = []
 
         for msg in request.messages:
-            content = []
-            if isinstance(msg.content, list):
-                # Handle image_url in content
-                for item in msg.content:
-                    if item["type"] == "text":
-                        content.append(item["text"])
-            else:
-                content = msg.content
-            chat_messages.append({"role": msg.role, "content": content})
+            if isinstance(msg.content, str):
+                chat_messages.append({"role": msg.role, "content": msg.content})
+            elif isinstance(msg.content, list):
+                text_content = ""
+                for content_part in msg.content:
+                    if content_part.type == "text":
+                        text_content += content_part.text + " "
+                    elif content_part.type == "image_url":
+                        image_url = decode_base64_data_uri(content_part.image_url["url"])
+                chat_messages.append(
+                    {"role": msg.role, "content": text_content.strip()}
+                )
 
-        print(chat_messages)
+        # if not image_url and model_type in MODELS["vlm"]:
+        #     raise HTTPException(
+        #         status_code=400, detail="Image URL not provided for VLM model"
+        #     )
 
         prompt = ""
         if model.config.model_type != "paligemma":
             prompt = apply_vlm_chat_template(processor, config, chat_messages)
         else:
-            prompt = request.messages[-1].content
+            prompt = chat_messages[-1]["content"]
         if stream:
             generator = vlm_stream_generator(
                     model,
                     request.model,
                     processor,
-                    image,
+                    image_url,
                     prompt,
                     image_processor,
                     max_tokens=request.max_tokens,
@@ -430,7 +471,7 @@ async def chat_completion(request: ChatCompletionRequest):
             output = vlm_generate(
                 model,
                 processor,
-                image,
+                image_url,
                 prompt,
                 max_tokens=request.max_tokens,
                 temp=request.temperature,
@@ -474,6 +515,7 @@ async def chat_completion(request: ChatCompletionRequest):
                     prompt,
                     request.max_tokens,
                     request.temperature,
+                    draft_model=draft_model,
                     stop_words=stop_words,
                     stream_options=request.stream_options,
                 )
