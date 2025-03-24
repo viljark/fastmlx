@@ -378,11 +378,9 @@ def vlm_stream_generator(
         if stop_words:
             for sw in stop_words:
                 if isinstance(token, str):
-                    print(token)
                     if sw in token:
                         token = token.replace(sw, '')
                 elif hasattr(token, 'text') and isinstance(token.text, str):
-                    print(token.text)
                     if sw in token.text:
                         token.text = token.text.replace(sw, '')
                 else:
@@ -494,11 +492,12 @@ def lm_stream_generator(
     )
     prompt_tokens = len(tokenizer.encode(prompt)) if INCLUDE_USAGE else None
     completion_tokens = 0
+    from_draft_count = 0
     empty_usage: Usage = None
     stop_words = kwargs.pop("stop_words", [])
     completion_id = f"chatcmpl-{os.urandom(4).hex()}"
     tic = time.perf_counter()
-
+    
     for token in lm_stream_generate(
         model, tokenizer, prompt, max_tokens=max_tokens, draft_model=draft_model
     ):
@@ -510,6 +509,9 @@ def lm_stream_generator(
                 # Update token length info
         if INCLUDE_USAGE:
             completion_tokens += 1
+            from_draft = getattr(token, 'from_draft', False)
+            if  from_draft:
+                from_draft_count +=1
         choices = [
                 {
                     "index": 0,
@@ -535,8 +537,9 @@ def lm_stream_generator(
     if INCLUDE_USAGE:
         gen_time = time.perf_counter() - tic
         gen_tps = (completion_tokens - 1) / gen_time
-
+        from_draft_percentage = (from_draft_count / completion_tokens) * 100
         print(f"Generation: {gen_tps:.1f} tokens-per-sec ")
+        print(f"Draft acceptance: {from_draft_percentage:.1f}% ")
         chunk = ChatCompletionChunk(
             id=completion_id,
             created=int(time.time()),
@@ -545,6 +548,7 @@ def lm_stream_generator(
             usage=Usage(
                 gen_tps=f"{gen_tps:.1f}t/s",
                 gen_time=f"{gen_time:.1f}s",
+                draft_acceptance=f"{from_draft_percentage:.1f}%",
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,

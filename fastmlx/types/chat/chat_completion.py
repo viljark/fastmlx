@@ -35,6 +35,7 @@ class ImageURL(BaseModel):
 class Usage(BaseModel):
     gen_tps: str
     gen_time: str
+    draft_acceptance: Optional[str] = None
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
