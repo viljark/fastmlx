@@ -100,40 +100,60 @@ class ModelProvider:
     def is_model_loaded(self, model_name: str) -> bool:
         return model_name in self.models
 
-    async def load_model(self, model_name: str, use_vlm_model = False):
+    async def load_model(self, model_name: str, has_image = False):
         async with self.lock:
             model_id = model_name
-            if model_name not in self.models:
-                print('loading model:', model_name)
+            # Determine if VLM is needed for this request
+            models = self.get_cached_and_local_models()
+            for model in models:
+                if model["id"] == model_name:
+                    model_name = model["local_path"] if model["local_path"].startswith("./models") else model_name
+                    model_id = model["id"]
+                    break
+                    
+            config = load_config(model_name)
+            model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
+            use_vlm_model = model_type in MODELS["vlm"] and ((model_type == 'gemma3' and has_image) or model_type != 'gemma3')
+            
+            # Add suffix to track VLM vs regular model instances
+            instance_id = f"{model_id}_vlm" if use_vlm_model else model_id
+            
+            # Check if we need to switch model type (VLM to regular or vice versa)
+            opposite_instance_id = f"{model_id}_vlm" if not use_vlm_model else model_id
+            if opposite_instance_id in self.models:
+                print(f"Unloading opposite type model: {opposite_instance_id}")
+                # Wait for generating processes to finish
+                while self.generating_count[opposite_instance_id] > 0:
+                    print(f'waiting for model to finish generating: {opposite_instance_id}, count: {self.generating_count[opposite_instance_id]}')
+                    await asyncio.sleep(1)
+                await self.remove_model(opposite_instance_id, no_lock=True)
+            
+            # Load requested model if not already loaded
+            if instance_id not in self.models:
+                print(f'loading model: {model_name} (instance_id: {instance_id}, VLM: {use_vlm_model})')
+                
+                # Check if we need to unload other models to make space
                 if len(self.models) >= self.settings['max_loaded_models']:
                     models_to_remove = [loaded_model_name for loaded_model_name in self.models.keys()]
                     for loaded_model_name in models_to_remove:
                         while self.generating_count[loaded_model_name] > 0:
-                            print('waiting for model to finish generating', loaded_model_name, self.generating_count[loaded_model_name])
+                            print(f'waiting for model to finish generating: {loaded_model_name}, count: {self.generating_count[loaded_model_name]}')
                             await asyncio.sleep(1)
-                        print('unloading idle model', loaded_model_name)
-                        await self.remove_model(loaded_model_name, no_lock= True)
-
-                models = self.get_cached_and_local_models()
-
-                for model in models:
-                    if model["id"] == model_name:
-                        model_name = model["local_path"] if model["local_path"].startswith("./models") else model_name
-                        model_id = model["id"]
-                        break
-
-                config = load_config(model_name)
+                        print(f'unloading idle model: {loaded_model_name}')
+                        await self.remove_model(loaded_model_name, no_lock=True)
+                
+                # Load the appropriate model type
+                print(f"Model type: {model_type}, use_vlm_model: {use_vlm_model}")
                 if use_vlm_model:
-                    self.models[model_id] = load_vlm_model(model_name, config)
+                    self.models[instance_id] = load_vlm_model(model_name, config)
                 else:
-                    self.models[model_id] = load_lm_model(model_name, config)
-                self.generating_count[model_id] = 0
-                # Update last access time for the loaded model
-
-            # Update last access time for the requested model
-            self.last_access_times[model_id] = time.time()
-
-            return self.models[model_id]
+                    self.models[instance_id] = load_lm_model(model_name, config)
+                    
+                self.generating_count[instance_id] = 0
+                
+            # Update last access time for the loaded model
+            self.last_access_times[instance_id] = time.time()
+            return self.models[instance_id]
     
     async def load_draft_model(self, model_name):
         draft_model_map = {
@@ -422,21 +442,22 @@ async def chat_completion(request: ChatCompletionRequest):
             if image_url:
                 break
 
-    config = load_config(request.model)
-    model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
-    use_vlm_model = model_type in MODELS["vlm"] and ((model_type == 'gemma3' and image_url is not None) or model_type != 'gemma3')
 
 
-    print(f"Model type: {model_type}")
-    print(f"Use VLM model: {use_vlm_model}")
-
-    model_data = await model_provider.load_model(request.model, use_vlm_model)
+    has_image = image_url is not None
+    model_data = await model_provider.load_model(request.model, has_image)
     model = model_data["model"]
     draft_model = await model_provider.load_draft_model(request.model)
 
     stop_words = get_eom_token(request.model)
     model_provider.start_generating(request.model)
 
+    config = model_data["config"]
+    model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
+
+    print(f"Model type: {model_type}")
+
+    use_vlm_model = model_type in MODELS["vlm"] and ((model_type == 'gemma3' and has_image) or model_type != 'gemma3')
 
     if use_vlm_model:
         processor = model_data["processor"]
