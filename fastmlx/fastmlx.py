@@ -100,7 +100,7 @@ class ModelProvider:
     def is_model_loaded(self, model_name: str) -> bool:
         return model_name in self.models
 
-    async def load_model(self, model_name: str):
+    async def load_model(self, model_name: str, use_vlm_model = False):
         async with self.lock:
             model_id = model_name
             if model_name not in self.models:
@@ -123,8 +123,7 @@ class ModelProvider:
                         break
 
                 config = load_config(model_name)
-                model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
-                if model_type in MODELS["vlm"]:
+                if use_vlm_model:
                     self.models[model_id] = load_vlm_model(model_name, config)
                 else:
                     self.models[model_id] = load_lm_model(model_name, config)
@@ -140,7 +139,9 @@ class ModelProvider:
         draft_model_map = {
             "Qwen2.5-Coder": "mlx-community/Qwen2.5-Coder-0.5B-Instruct-4bit",
             "QwQ": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-            "Mistral-Small-3.1": "cnfusion/Mistral-Small-3.1-DRAFT-0.5B-mlx-4Bit"
+            "Mistral-Small-3.1": "cnfusion/Mistral-Small-3.1-DRAFT-0.5B-mlx-4Bit",
+            # "Qwen3": "mlx-community/Qwen3-0.6B-4bit", # slower with speculative decoding
+            # "gemma-3": "mlx-community/gemma-3-1b-it-qat-4bit", # slower with speculative decoding
         }
         
         for key, value in draft_model_map.items():
@@ -393,7 +394,7 @@ def decode_base64_data_uri(data_uri: str) -> Image.Image:
         # Create a BytesIO object from the decoded data
         image_source = BytesIO(image_data)
         # Open the image using PIL
-        image = Image.open(image_source)
+        image = Image.open(image_source).convert("RGB")
         return image
     except Exception as e:
         raise ValueError(f"Failed to decode Base64 data URI: {data_uri} with error {e}") from e
@@ -409,15 +410,35 @@ async def chat_completion(request: ChatCompletionRequest):
         request.messages = [msg for msg in request.messages if msg.role!= "system"]
 
     stream = request.stream
-    model_data = await model_provider.load_model(request.model)
+
+    # use mlx-lm with speculative decoding if no image provided for gemma3
+    image_url = None
+    for msg in request.messages:
+        if isinstance(msg.content, list):
+            for content_part in msg.content:
+                if content_part.type == "image_url":
+                    image_url = decode_base64_data_uri(content_part.image_url["url"])
+                    break
+            if image_url:
+                break
+
+    config = load_config(request.model)
+    model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
+    use_vlm_model = model_type in MODELS["vlm"] and ((model_type == 'gemma3' and image_url is not None) or model_type != 'gemma3')
+
+
+    print(f"Model type: {model_type}")
+    print(f"Use VLM model: {use_vlm_model}")
+
+    model_data = await model_provider.load_model(request.model, use_vlm_model)
     model = model_data["model"]
     draft_model = await model_provider.load_draft_model(request.model)
-    config = model_data["config"]
-    model_type = MODEL_REMAPPING.get(config["model_type"], config["model_type"])
+
     stop_words = get_eom_token(request.model)
     model_provider.start_generating(request.model)
 
-    if model_type in MODELS["vlm"]:
+
+    if use_vlm_model:
         processor = model_data["processor"]
         image_processor = model_data["image_processor"]
 
